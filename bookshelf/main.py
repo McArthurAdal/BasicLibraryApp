@@ -1,18 +1,32 @@
 
 from flask import current_app, Flask, redirect, render_template
-from flask import request, url_for
+from flask import request, url_for, session
 import logging
 from google.cloud import logging as cloud_logging
+import json
+import os
+from urllib.parse import urlparse
 
 import booksdb
-
 import storage
+import secrets
+import translate
+import profiledb
 
 app = Flask(__name__)
 app.config.update(
-    SECRET_KEY='secret', # don't store SECRET_KEY in code in a production app
+    SECRET_KEY=secrets.get_secret('flask-secret-key'), # don't store SECRET_KEY in code in a production app
     MAX_CONTENT_LENGTH=8 * 1024 * 1024,
     ALLOWED_EXTENSIONS=set(['png', 'jpg', 'jpeg', 'gif']),
+    CLIENT_SECRETS=json.loads(secrets.get_secret('bookshelf-client-secrets')),
+    SCOPES=[
+        'openid',
+        'https://www.googleapis.com/auth/contacts.readonly',
+        'https://www.googleapis.com/auth/userinfo.email',
+        'https://www.googleapis.com/auth/userinfo.profile',
+    ],
+    EXTERNAL_HOST_URL=os.getenv('EXTERNAL_HOST_URL'),
+
 )
 
 app.debug = True
@@ -31,6 +45,122 @@ def log_request(req):
     Log request
     """
     current_app.logger.info('REQ: {0} {1}'.format(req.method, req.url))
+
+
+def logout_session():
+    """
+    Clears known session items.
+    """
+    session.pop('credentials', None)
+    session.pop('user', None)
+    session.pop('state', None)
+    session.pop('error_message', None)
+    session.pop('login_return', None)
+    return
+
+
+def external_url(url):
+    """
+    Cloud Shell routes https://8080-***/ to localhost over http
+    This function replaces the localhost host with the configured scheme + hostname
+    """
+    external_host_url = current_app.config['EXTERNAL_HOST_URL']
+    if external_host_url is None:
+        # force https
+        if url.startswith('http://'):
+            url = f"https://{url[7:]}"
+        return url
+
+    # replace the scheme and hostname with the external host URL
+    parsed_url = urlparse(url)
+    replace_string = f"{parsed_url.scheme}://{parsed_url.netloc}"
+    new_url = f"{external_host_url}{url[len(replace_string):]}"
+    return new_url
+
+
+@app.route('/error')
+def error():
+    """
+    Display an error.
+    """
+
+    log_request(request)
+
+    if "error_message" not in session:
+        return redirect(url_for('.list'))
+
+    # render error
+    return render_template('error.html', error_message=session.pop('error_message', None))
+
+
+@app.route("/login")
+def login():
+    """
+    Login if not already logged in.
+    """
+    log_request(request)
+
+    if not "credentials" in session:
+        # need to log in
+
+        current_app.logger.info('logging in')
+
+        # get authorization URL
+        authorization_url, state = oauth.authorize(
+            callback_uri=external_url(url_for('oauth2callback', _external=True)),
+            client_config=current_app.config['CLIENT_SECRETS'],
+            scopes=current_app.config['SCOPES'])
+
+        current_app.logger.info(f"authorization_url={authorization_url}")
+
+        # save state for verification on callback
+        session['state'] = state
+
+        return redirect(authorization_url)
+
+    # already logged in
+    return redirect(session.pop('login_return', url_for('.list')))
+
+
+@app.route("/oauth2callback")
+def oauth2callback():
+    """
+    Callback destination during OAuth process.
+    """
+    log_request(request)
+
+    # check for error, probably access denied by user
+    error = request.args.get('error', None)
+    if error:
+        session['error_message'] = f"{error}"
+        return redirect(url_for('.error'))
+
+    # handle the OAuth2 callback
+    credentials, user_info = oauth.handle_callback(
+        callback_uri=external_url(url_for('oauth2callback', _external=True)),
+        client_config=current_app.config['CLIENT_SECRETS'],
+        scopes=current_app.config['SCOPES'],
+        request_url=external_url(request.url),
+        stored_state=session.pop('state', None),
+        received_state=request.args.get('state', ''))
+
+    session['credentials'] = credentials
+    session['user'] = user_info
+    current_app.logger.info(f"user_info={user_info}")
+
+    return redirect(session.pop('login_return', url_for('.list')))
+
+
+@app.route("/logout")
+def logout():
+    """
+    Log out and return to root page.
+    """
+    log_request(request)
+
+    logout_session()
+    return redirect(url_for('.list'))
+
 def upload_image_file(img):
     """
     Upload the user-uploaded file to Cloud Storage and retrieve its
@@ -86,6 +216,13 @@ def add():
     """
     log_request(request)
 
+    
+    # must be logged in
+    if "credentials" not in session:
+        session['login_return'] = url_for('.add')
+        return redirect(url_for('.login'))
+
+
     # Save details if form was posted
     if request.method == 'POST':
 
@@ -117,6 +254,13 @@ def edit(book_id):
     If POST, update the book based on the specified form.
     """
     log_request(request)
+
+    
+    # must be logged in
+    if "credentials" not in session:
+        session['login_return'] = url_for('.edit', book_id=book_id)
+        return redirect(url_for('.login'))
+
 
     # read existing book details
     book = booksdb.read(book_id)
@@ -154,12 +298,46 @@ def delete(book_id):
     """
     log_request(request)
 
+    
+    # must be logged in
+    if "credentials" not in session:
+        session['login_return'] = url_for('.view', book_id=book_id)
+        return redirect(url_for('.login'))
+
+
     # delete book
     booksdb.delete(book_id)
 
     # render list of remaining books
     return redirect(url_for('.list'))
 
+@app.route('/profile', methods=['GET', 'POST'])
+def profile():
+    """
+    If GET, show the form to collect updated details for the user profile.
+    If POST, update the profile based on the specificied form.
+    """
+
+    log_request(request)
+
+    # must be logged in 
+    if 'credentials' not in session:
+        session['login_return'] = url_for('.profile')
+        return redirect(url_for('.login'))
+    
+    # read existing profile
+    email = session['user']['email']
+    profile = profiledb.read(email)
+
+    if request.method == 'POST':
+        data = request.form.to_dict(flat=True)
+        profiledb.update(data, email)
+        session['prefered_language'] = data['preferredLanguage']
+
+        return redirect(url_for('.list'))
+
+    return render_template('profile.html', action='Edit', profile=profile,
+            languages=translate.get_languages())
 
 # this is only used when running locally
 if __name__ == '__main__':
